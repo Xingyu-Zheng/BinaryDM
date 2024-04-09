@@ -33,29 +33,29 @@ Test:
 
 - baseline-1bit
 
-  ![pokemon-baseline](..\imgs\pokemon-baseline.png)
+  ![pokemon-baseline](../imgs/pokemon-baseline.png)
 
 - LSQ-2bit
 
-  ![pokemon-lsq](..\imgs\pokemon-lsq.png)
+  ![pokemon-lsq](../imgs/pokemon-lsq.png)
 
 - BinaryDM-1bit
 
-  ![pokemon-binarydm](..\imgs\pokemon-binarydm.png)
+  ![pokemon-binarydm](../imgs/pokemon-binarydm.png)
 
 ##### m1guelpf/nouns
 
 - baseline-1bit
 
-  ![pokemon-baseline](..\imgs\nouns-baseline.png)
+  ![pokemon-baseline](../imgs/nouns-baseline.png)
 
 - LSQ-2bit
 
-  ![pokemon-lsq](..\imgs\nouns-lsq.png)
+  ![pokemon-lsq](../imgs/nouns-lsq.png)
 
 - BinaryDM-1bit
 
-  ![pokemon-binarydm](..\imgs\nouns-binarydm.png)
+  ![pokemon-binarydm](../imgs/nouns-binarydm.png)
 
 ## Comments
 
