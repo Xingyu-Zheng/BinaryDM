@@ -2,6 +2,8 @@
 
 This implementation supports the paper "BinaryDM: Towards Accurate Binarization of Diffusion Model". [[PDF](https://arxiv.org/abs/2404.05662)]
 
+![main](imgs/main.png)
+
 ### Requirements
 
 Establish a virtual environment and install dependencies as referred to [latent-diffusion](https://github.com/CompVis/latent-diffusion).
