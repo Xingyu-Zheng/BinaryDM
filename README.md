@@ -23,7 +23,7 @@ Establish a virtual environment and install dependencies as referred to [latent-
 
 - Results for LDM-4 on LSUN-Bedrooms in unconditional generation by DDIM with 100 steps.
 
-<img src="C:\Users\Zheng Xingyu\Desktop\BinaryDM-1\imgs\table.png" alt="table" style="zoom: 40%;" />
+<img src="imgs/table.png" alt="table" style="zoom: 40%;" />
 
 #### Visualization Results
 
