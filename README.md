@@ -36,13 +36,14 @@ Establish a virtual environment and install dependencies as referred to [latent-
 If you find *BinaryDM* is useful and helpful to your work, please kindly cite this paper:
 
 ```
-@misc{zheng2024accurate,
-      title={Towards Accurate Binarization of Diffusion Model}, 
-      author={Xingyu Zheng and Haotong Qin and Xudong Ma and Mingyuan Zhang and Haojie Hao and Jiakai Wang and Zixiang Zhao and Jinyang Guo and Xianglong Liu},
+@misc{zheng2024binarydmaccurateweightbinarization,
+      title={BinaryDM: Accurate Weight Binarization for Efficient Diffusion Models}, 
+      author={Xingyu Zheng and Xianglong Liu and Haotong Qin and Xudong Ma and Mingyuan Zhang and Haojie Hao and Jiakai Wang and Zixiang Zhao and Jinyang Guo and Michele Magno},
       year={2024},
       eprint={2404.05662},
       archivePrefix={arXiv},
-      primaryClass={cs.CV}
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2404.05662}, 
 }
 ```
 
