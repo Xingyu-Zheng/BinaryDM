@@ -1,3 +1,11 @@
+"""
+wild mixture of
+https://github.com/lucidrains/denoising-diffusion-pytorch/blob/7706bdfc6f527f58d33f84b7b522e61e6e3164b3/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py
+https://github.com/openai/improved-diffusion/blob/e94489283bb876ac1477d5dd7709bbbd2d9902ce/improved_diffusion/gaussian_diffusion.py
+https://github.com/CompVis/taming-transformers
+-- merci
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -16,6 +24,7 @@ from ldm.modules.distributions.distributions import normal_kl, DiagonalGaussianD
 from ldm.models.autoencoder import VQModelInterface, IdentityFirstStage, AutoencoderKL
 from ldm.modules.diffusionmodules.util import make_beta_schedule, extract_into_tensor, noise_like
 from ldm.models.diffusion.ddim import DDIMSampler
+from ldm.modules.diffusionmodules.openaimodel_ours import TimestepEmbedSequential
 
 
 __conditioning_keys__ = {'concat': 'c_concat',
@@ -484,22 +493,23 @@ class LatentDiffusion(DDPM):
             print("### USING STD-RESCALING ###")
         # binarize
         if len(self.model.diffusion_model.module_groups) > 0:
-            if self.model.diffusion_model.modele_counters in [0, 1, 2, 3, 4]:
-                module_group = self.model.diffusion_model.module_groups.pop()
-                for module in module_group:
-                    module.set_precision('bnn')
-                self.model.diffusion_model.bnn_modules[0].set_precision('full')
-                self.model.diffusion_model.bnn_modules[1].set_precision('full')
-                self.model.diffusion_model.bnn_modules[2].set_precision('full')
-                self.model.diffusion_model.bnn_modules[-1].set_precision('full')
-                for name, module in self.model.diffusion_model.named_modules():
-                    if hasattr(module, 'precision'):
-                        print(name, module.precision)
-        if self.model.diffusion_model.modele_counters == 5:
-            for module in self.model.diffusion_model.qkv_attention_legacy:
-                module.binary_act = True
+            module_group = self.model.diffusion_model.module_groups.pop()
+            for module in module_group:
+                module.precision = 'bnn'
+            for name, module in self.model.diffusion_model.named_modules():
+                if hasattr(module, 'precision'):
+                    print(name, module.precision)
+        if self.model.diffusion_model.modele_counters == 100000:
+            for name, module in self.model.diffusion_model.named_modules():
+                module.order = 1
+                if hasattr(module, 'order'):
+                    print(name, module.order)
+                if hasattr(module, 'scaling_second_order'):
+                    print(name, module.scaling_second_order)
         self.model.diffusion_model.modele_counters += 1
+        self.pca = 0
         
+
     def register_schedule(self,
                           given_betas=None, beta_schedule="linear", timesteps=1000,
                           linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
@@ -1022,6 +1032,9 @@ class LatentDiffusion(DDPM):
     def p_losses(self, x_start, cond, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
 
         # distillation
         t_features = []
@@ -1031,7 +1044,6 @@ class LatentDiffusion(DDPM):
             t_features.append(output.detach())
         def s_forward_hook(module, input, output):
             s_features.append(output)
-        from ldm.modules.diffusionmodules.openaimodel_ours import TimestepEmbedSequential
         hooks = []
         ### teacher
         global fp_model
@@ -1061,6 +1073,7 @@ class LatentDiffusion(DDPM):
             self.pca_V_list
         except:
             self.pca_V_list = []
+
         for (s_feature, t_feature) in zip(s_features, t_features):
             try:
                 K = self.pca_V_list[index]
@@ -1077,8 +1090,12 @@ class LatentDiffusion(DDPM):
             index += 1
         loss_distil = loss_distil / len(s_features)
         
-        loss_dict = {}
-        prefix = 'train' if self.training else 'val'
+        l2_weight = 1.0
+        l2_parameters = []
+        for name, parameter in self.model.diffusion_model.named_parameters():
+            if 'scaling_second_order' in name:
+                l2_parameters.append(parameter.view(-1))
+        loss_l2 = l2_weight * torch.square(torch.cat(l2_parameters)).sum()
 
         if self.parameterization == "x0":
             target = x_start
@@ -1090,9 +1107,9 @@ class LatentDiffusion(DDPM):
         loss_simple = self.get_loss(model_output, target, mean=False).mean([1, 2, 3])
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
-        logvar_t = self.logvar[t].to(self.device)
+        logvar_t = self.logvar[t.to(self.logvar.device)].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+        
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
@@ -1106,8 +1123,12 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss': loss})
 
         loss_distil = loss_distil * 1e-4
-        loss = loss + loss_distil
+        loss_l2 = loss_l2 * 0.09
+        
+        loss = loss + loss_distil + loss_l2 
+        
         loss_dict.update({f'{prefix}/loss_distil': loss_distil})
+        loss_dict.update({f'{prefix}/loss_l2': loss_l2})
 
         return loss, loss_dict
 
@@ -1429,6 +1450,25 @@ class LatentDiffusion(DDPM):
         lr = self.learning_rate
         params = list(self.model.parameters())
         
+        # fr_params = []
+        # new_params = []
+        
+        # # import pdb; pdb.set_trace()
+        # self.model2.state_dict().keys()
+        # for name, param in self.model.named_parameters():
+        #     if "scaling_first_order" in name:
+        #         new_params.append(param)
+        #         print(name,"train")
+        #     elif "scaling_second_order" in name:
+        #         new_params.append(param)
+        #         print(name,"train")
+        #     else:
+        #         # fr_params.append(param)
+        #         # print(name,"keep")
+        #         new_params.append(param)
+        #         print(name,"train")
+                
+        
         if self.cond_stage_trainable:
             print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
             params = params + list(self.cond_stage_model.parameters())
@@ -1436,7 +1476,12 @@ class LatentDiffusion(DDPM):
             print('Diffusion model optimizing logvar')
             params.append(self.logvar)
         
+        # opt = [torch.optim.AdamW(new_params, lr=lr), torch.optim.SGD(fr_params, lr=0)]
         opt = torch.optim.AdamW(params, lr=lr)
+        # opt = torch.optim.AdamW(new_params, lr=lr, eps=1e-02)
+        # print('weight_decay', None)
+        # print('eps=1e-02')
+        # print('adamW', lr)
         if self.use_scheduler:
             assert 'target' in self.scheduler_config
             scheduler = instantiate_from_config(self.scheduler_config)
@@ -1449,6 +1494,7 @@ class LatentDiffusion(DDPM):
                     'frequency': 1
                 }]
             return [opt], scheduler
+            # return opt, scheduler
         return opt
 
     @torch.no_grad()

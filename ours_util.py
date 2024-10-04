@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
 
 
 class BinaryQuantize(torch.autograd.Function):
@@ -40,10 +39,10 @@ class _ActQ(nn.Module):
         self.nbits = nbits_a
         self.alpha = nn.Parameter(torch.Tensor(1))
         self.init_scale = False
-        self.Qn = -2 ** (self.nbits - 1)
-        self.Qp = 2 ** (self.nbits - 1) - 1
 
     def forward(self, x):
+        self.Qn = -2 ** (self.nbits - 1)
+        self.Qp = 2 ** (self.nbits - 1) - 1
         if not self.init_scale:
             self.alpha.data.copy_(2 * x.abs().mean() / math.sqrt(self.Qp))
             self.init_state = True
@@ -51,6 +50,45 @@ class _ActQ(nn.Module):
         alpha = grad_scale(self.alpha, g)
         x = round_pass((x / alpha).clamp(self.Qn, self.Qp)) * alpha
         return x
+
+# min-max
+def init_quantization_scale(x: torch.Tensor, channel_wise: bool = False, n_bits: int = 8):
+    delta, zero_point = None, None
+    if channel_wise:
+        x_clone = x.clone().detach()
+        n_channels = x_clone.shape[0]
+        if len(x.shape) == 4:
+            x_max = x_clone.abs().max(dim=-1)[0].max(dim=-1)[0].max(dim=-1)[0]
+        elif len(x.shape) == 3:
+            x_max = x_clone.abs().max(dim=-1)[0].max(dim=-1)[0]
+        else:
+            x_max = x_clone.abs().max(dim=-1)[0]
+        delta = x_max.clone()
+        zero_point = x_max.clone()
+        # determine the scale and zero point channel-by-channel
+        for c in range(n_channels):
+            delta[c], zero_point[c] = init_quantization_scale(x_clone[c], channel_wise=False, n_bits=n_bits)
+        if len(x.shape) == 4:
+            delta = delta.view(-1, 1, 1, 1)
+            zero_point = zero_point.view(-1, 1, 1, 1)
+        elif len(x.shape) == 3:
+            delta = delta.view(-1, 1, 1)
+            zero_point = zero_point.view(-1, 1, 1)
+        else:
+            delta = delta.view(-1, 1)
+            zero_point = zero_point.view(-1, 1)
+    else:
+        x_min = min(x.min().item(), 0)
+        x_max = max(x.max().item(), 0)
+        delta = float(x_max - x_min) / (2 ** n_bits - 1)
+        if delta < 1e-8:
+            import warnings
+            warnings.warn('Quantization range close to zero: [{}, {}]'.format(x_min, x_max))
+            delta = 1e-8
+        zero_point = round(-x_min / delta)
+        delta = torch.tensor(delta).type_as(x)
+
+    return delta, zero_point
 
 class BNNConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, bias=False, dilation=0, transposed=False, output_padding=None, groups=1, precision='bnn', order=2):
@@ -73,21 +111,49 @@ class BNNConv2d(nn.Module):
         self.order = order
         self.scaling_first_order = nn.Parameter(torch.rand(out_channels, 1, 1, 1) * 0.001, requires_grad=True)
         self.scaling_second_order = nn.Parameter(torch.rand(out_channels, 1, 1, 1) * 0.001, requires_grad=True)
+        
         self.init_scale = False
         
         self.precision = precision
         self.bnn_mode = 'bnn'
 
-        self.binary_act = True
+        self.binary_act = False
         self.quantizer_a = _ActQ()
+        
+        self.is_int = False
+        self.nbits = 8
+        self.n_levels = 2 ** self.nbits
+        
+        if self.in_channels != self.out_channels:
+            self.shortcut = nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, stride=self.stride, padding=0)
+        self.shortcut_scale = torch.nn.Parameter(torch.ones(1) * 0.3, requires_grad=True)
 
     def forward(self, x, bnn_mode='bnn'):
         
+        x_raw = x
         if 'full' in [self.precision, self.bnn_mode, bnn_mode]:
             return F.conv2d(x, self.weight, stride=self.stride, padding=self.padding, bias=self.bias)
 
         if self.binary_act:
             x = self.quantizer_a(x)
+
+        if self.is_int:
+            alpha, zero = init_quantization_scale(self.weight, channel_wise=True)
+            x_int = round_pass(self.weight / alpha) + zero
+            x_quant = torch.clamp(x_int, 0, self.n_levels - 1)
+            x_dequant = (x_quant - zero) * alpha
+            y = F.conv2d(x, x_dequant, stride=self.stride, padding=self.padding, bias=self.bias)
+
+            if self.in_channels == self.out_channels:
+                if x_raw.shape[-1] < y.shape[-1]:
+                    shortcut = F.interpolate(x_raw, scale_factor=2, mode="nearest")
+                elif x_raw.shape[-1] > y.shape[-1]:
+                    shortcut = avg_pool_nd(2, kernel_size=self.stride, stride=self.stride)(x_raw)
+                else:
+                    shortcut = x_raw
+            else:
+                shortcut = self.shortcut(x_raw)
+            return y + shortcut * torch.abs(self.shortcut_scale)
 
         bw = self.weight
         if not self.init_scale:
@@ -98,8 +164,17 @@ class BNNConv2d(nn.Module):
         bw = BinaryQuantize.apply(bw) * self.scaling_first_order
 
         if self.order == 1:
-            self.init_scale = True
-            return F.conv2d(x, bw, stride=self.stride, padding=self.padding, bias=self.bias)
+            y = F.conv2d(x, bw, stride=self.stride, padding=self.padding, bias=self.bias)
+            if self.in_channels == self.out_channels:
+                if x_raw.shape[-1] < y.shape[-1]:
+                    shortcut = F.interpolate(x_raw, scale_factor=2, mode="nearest")
+                elif x_raw.shape[-1] > y.shape[-1]:
+                    shortcut = avg_pool_nd(2, kernel_size=self.stride, stride=self.stride)(x_raw)
+                else:
+                    shortcut = x_raw
+            else:
+                shortcut = self.shortcut(x_raw)
+            return y + shortcut * torch.abs(self.shortcut_scale)
 
         first_res_bw = self.weight - bw
         
@@ -113,7 +188,16 @@ class BNNConv2d(nn.Module):
         
         y = F.conv2d(x, bw, stride=self.stride, padding=self.padding, bias=self.bias)
 
-        return y
+        if self.in_channels == self.out_channels:
+            if x_raw.shape[-1] < y.shape[-1]:
+                shortcut = F.interpolate(x_raw, scale_factor=2, mode="nearest")
+            elif x_raw.shape[-1] > y.shape[-1]:
+                shortcut = avg_pool_nd(2, kernel_size=self.stride, stride=self.stride)(x_raw)
+            else:
+                shortcut = x_raw
+        else:
+            shortcut = self.shortcut(x_raw)
+        return y + shortcut * torch.abs(self.shortcut_scale)
 
     def set_precision(self, precision):
         self.precision = precision
@@ -145,8 +229,12 @@ class BNNConv1d(nn.Module):
         self.precision = precision
         self.bnn_mode = 'bnn'
 
-        self.binary_act = True
+        self.binary_act = False
         self.quantizer_a = _ActQ()
+        
+        self.is_int = False
+        self.nbits = 8
+        self.n_levels = 2 ** self.nbits
 
 
     def forward(self, x, bnn_mode='bnn'):
@@ -157,6 +245,14 @@ class BNNConv1d(nn.Module):
         if self.binary_act:
             x = self.quantizer_a(x)
 
+        if self.is_int:
+            alpha, zero = init_quantization_scale(self.weight, channel_wise=True)
+            x_int = round_pass(self.weight / alpha) + zero
+            x_quant = torch.clamp(x_int, 0, self.n_levels - 1)
+            x_dequant = (x_quant - zero) * alpha
+            y = F.conv1d(x, x_dequant, stride=self.stride, padding=self.padding, bias=self.bias)
+            return y
+
         bw = self.weight
         if not self.init_scale:
             real_weights = self.weight.view(self.shape)
@@ -166,7 +262,6 @@ class BNNConv1d(nn.Module):
         bw = BinaryQuantize.apply(bw) * self.scaling_first_order
 
         if self.order == 1:
-            self.init_scale = True
             return F.conv1d(x, bw, stride=self.stride, padding=self.padding, bias=self.bias)
 
         first_res_bw = self.weight - bw
@@ -200,18 +295,31 @@ class BNNLinear(nn.Linear):
         self.precision = precision
         self.bnn_mode = 'bnn'
 
-        self.binary_act = True
+        self.binary_act = False
         self.quantizer_a = _ActQ()
+        
+        self.is_int = False
+        self.nbits = 8
+        self.n_levels = 2 ** self.nbits
 
     def forward(self, input, bnn_mode='bnn'):
         
         if 'full' in [self.precision, self.bnn_mode, bnn_mode]:
             return F.linear(input, self.weight, self.bias)
+        if self.is_int:
+            if self.binary_act:
+                input = self.quantizer_a(input)
+            alpha, zero = init_quantization_scale(self.weight, channel_wise=True)
+            x_int = round_pass(self.weight / alpha) + zero
+            x_quant = torch.clamp(x_int, 0, self.n_levels - 1)
+            x_dequant = (x_quant - zero) * alpha
+            return F.linear(input, x_dequant, self.bias)
 
         ba = input
         if self.binary_act:
             ba = self.quantizer_a(ba)
-            
+
+
         bw = self.weight
         if not self.init_scale:
             real_weights = self.weight.view(self.weight.shape)
@@ -221,7 +329,6 @@ class BNNLinear(nn.Linear):
         bw = BinaryQuantize.apply(bw) * self.scaling_first_order
 
         if self.order == 1:
-            self.init_scale = True
             output = F.linear(ba, bw, self.bias)
             return output
 

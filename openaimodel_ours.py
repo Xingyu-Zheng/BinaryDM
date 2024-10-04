@@ -8,10 +8,8 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-# from ldm.modules.diffusionmodules.util import (
-from ldm.modules.diffusionmodules.ho_bi_util import (
-    _ActQ,
-    GroupNorm32,
+from ldm.modules.diffusionmodules.ours_util import (
+    _ActQ, BNNConv1d, BNNConv2d, BNNLinear,
     checkpoint,
     conv_nd,
     linear,
@@ -20,7 +18,7 @@ from ldm.modules.diffusionmodules.ho_bi_util import (
     normalization,
     timestep_embedding,
 )
-from ldm.modules.attention_hobi import SpatialTransformer
+from ldm.modules.attention import SpatialTransformer
 
 
 # dummy replace
@@ -237,11 +235,23 @@ class ResBlock(TimestepBlock):
         if self.out_channels == channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
-            self.skip_connection = conv_nd(
-                dims, channels, self.out_channels, 3, padding=1
-            )
+            # self.skip_connection = conv_nd(
+            #     dims, channels, self.out_channels, 3, padding=1
+            # )
+            if dims == 1:
+                self.skip_connection = nn.Conv1d(
+                    channels, self.out_channels, 3, padding=1
+                )
+            elif dims == 2:
+                self.skip_connection = nn.Conv2d(
+                    channels, self.out_channels, 3, padding=1
+                )
         else:
-            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+            # self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+            if dims == 1:
+                self.skip_connection = nn.Conv1d(channels, self.out_channels, 1)
+            elif dims == 2:
+                self.skip_connection = nn.Conv2d(channels, self.out_channels, 1)
 
     def forward(self, x, emb):
         """
@@ -706,9 +716,8 @@ class UNetModel(nn.Module):
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
             
-        from ldm.modules.diffusionmodules.ours_util import BNNConv1d, BNNConv2d, BNNLinear
-
         module_list = []
+        
         self.module_groups = [[] for _ in range(5)]
         self.modele_counters = 0
         self.emb_out_group = []
@@ -717,20 +726,22 @@ class UNetModel(nn.Module):
         module_list = []
         self.qkv_attention_legacy = []
         for name, module in self.named_modules():
-            # module.init_scale = True
-            # module.binary_act = True
-            # module.binary_act = False
+            module.binary_act = False
             if isinstance(module, BNNConv1d) or isinstance(module, BNNConv2d) or isinstance(module, BNNLinear):
                 module.set_precision('full')
                 if 'middle' in name:
                     module.order = 1
                     self.module_groups[4].append(module)
                 elif 'input_blocks' in name:
-                    if int(name.split('.')[1])//3 in [2,3]:
+                    if int(name.split('.')[1]) in [0]:
+                        module.is_int = True
+                    if int(name.split('.')[1]) in [6,7,8,9,10,11]:
                         module.order = 1
                     self.module_groups[int(name.split('.')[1])//3].append(module)
                 elif 'output_blocks' in name:
-                    if 3-int(name.split('.')[1])//3 in [2,3]:
+                    if int(name.split('.')[1]) in [11]:
+                        module.is_int = True
+                    if int(name.split('.')[1]) in [0,1,2,3,4,5]:
                         module.order = 1
                     self.module_groups[3-int(name.split('.')[1])//3].append(module)
                 else:
@@ -740,10 +751,18 @@ class UNetModel(nn.Module):
             if isinstance(module, QKVAttentionLegacy) or isinstance(module, SpatialTransformer):
                 self.qkv_attention_legacy.append(module)
                     
-        self.bnn_modules[0].set_precision('full')
-        self.bnn_modules[1].set_precision('full')
-        self.bnn_modules[2].set_precision('full')
-        self.bnn_modules[-1].set_precision('full')
+        self.bnn_modules[0].is_int = True
+        self.bnn_modules[1].is_int = True
+        self.bnn_modules[2].is_int = True
+        self.bnn_modules[-1].is_int = True
+        self.bnn_modules[0].precision = 'bnn'
+        self.bnn_modules[1].precision = 'bnn'
+        self.bnn_modules[2].precision = 'bnn'
+        self.bnn_modules[-1].precision = 'bnn'
+        self.bnn_modules[0].quantizer_a.nbits = 8
+        self.bnn_modules[1].quantizer_a.nbits = 8
+        self.bnn_modules[2].quantizer_a.nbits = 8
+        self.bnn_modules[-1].quantizer_a.nbits = 8
 
     def convert_to_fp16(self):
         """
